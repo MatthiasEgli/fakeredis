@@ -46,6 +46,14 @@ class FakeStrictRedis(object):
         self._db = DATABASES[db]
         self._db_num = db
 
+    def _kvc(self, key, test_class):
+        """
+        Checks if the provided key is an instance of the provided class
+        Raises redis.ResponseError if the check fails
+        """
+        if not isinstance(self._db.get(key, test_class())):
+            raise redis.ResponseError('Operation against a key holding the wrong kind of value')
+
     def flushdb(self):
         DATABASES[self._db_num].clear()
         return True
@@ -488,6 +496,7 @@ class FakeStrictRedis(object):
         return el
 
     def hdel(self, name, *keys):
+        self._kvc(name, dict)
         h = self._db.get(name, {})
         rem = 0
         for k in keys:
@@ -498,6 +507,7 @@ class FakeStrictRedis(object):
 
     def hexists(self, name, key):
         "Returns a boolean indicating if ``key`` exists within hash ``name``"
+        self._kvc(name, dict)
         if self._db.get(name, {}).get(key) is None:
             return 0
         else:
@@ -505,24 +515,29 @@ class FakeStrictRedis(object):
 
     def hget(self, name, key):
         "Return the value of ``key`` within the hash ``name``"
+        self._kvc(name, dict)
         return self._db.get(name, {}).get(key)
 
     def hgetall(self, name):
         "Return a Python dict of the hash's name/value pairs"
+        self._kvc(name, dict)
         return self._db.get(name, {})
 
     def hincrby(self, name, key, amount=1):
         "Increment the value of ``key`` in hash ``name`` by ``amount``"
+        self._kvc(name, dict)
         new = self._db.setdefault(name, {}).get(key, 0) + amount
         self._db[name][key] = new
         return new
 
     def hkeys(self, name):
         "Return the list of keys within hash ``name``"
+        self._kvc(name, dict)
         return self._db.get(name, {}).keys()
 
     def hlen(self, name):
         "Return the number of elements in hash ``name``"
+        self._kvc(name, dict)
         return len(self._db.get(name, {}))
 
     def hset(self, name, key, value):
@@ -530,6 +545,7 @@ class FakeStrictRedis(object):
         Set ``key`` to ``value`` within hash ``name``
         Returns 1 if HSET created a new field, otherwise 0
         """
+        self._kvc(name, dict)
         key_is_new = key not in self._db.get(name, {})
         self._db.setdefault(name, {})[key] = value
         return 1 if key_is_new else 0
@@ -539,6 +555,7 @@ class FakeStrictRedis(object):
         Set ``key`` to ``value`` within hash ``name`` if ``key`` does not
         exist.  Returns 1 if HSETNX created a field, otherwise 0.
         """
+        self._kvc(name, dict)
         if key in self._db.get(name, {}):
             return False
         self._db.setdefault(name, {})[key] = value
@@ -549,6 +566,7 @@ class FakeStrictRedis(object):
         Sets each key in the ``mapping`` dict to its corresponding value
         in the hash ``name``
         """
+        self._kvc(name, dict)
         if not mapping:
             raise redis.DataError("'hmset' with 'mapping' of length 0")
         self._db.setdefault(name, {}).update(mapping)
@@ -556,11 +574,13 @@ class FakeStrictRedis(object):
 
     def hmget(self, name, keys):
         "Returns a list of values ordered identically to ``keys``"
+        self._kvc(name, dict)
         h = self._db.get(name, {})
         return [h.get(k) for k in keys]
 
     def hvals(self, name):
         "Return the list of values within hash ``name``"
+        self._kvc(name, dict)
         return self._db.get(name, {}).values()
 
     def sadd(self, name, *values):
