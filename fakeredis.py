@@ -51,7 +51,7 @@ class FakeStrictRedis(object):
         Checks if the provided key is an instance of the provided class
         Raises redis.ResponseError if the check fails
         """
-        if not isinstance(self._db.get(key, test_class())):
+        if not isinstance(self._db.get(key, test_class()), test_class):
             raise redis.ResponseError('Operation against a key holding the wrong kind of value')
 
     def flushdb(self):
