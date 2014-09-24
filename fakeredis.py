@@ -4,21 +4,89 @@ import copy
 from ctypes import CDLL, POINTER, c_double, c_char_p, pointer
 from ctypes.util import find_library
 import fnmatch
-from urlparse import urlparse
 from collections import MutableMapping
 from datetime import datetime, timedelta
+import operator
+import sys
+import re
+
 import redis
 from redis.exceptions import ResponseError
 import redis.client
 
 
-__version__ = '0.4.1'
+__version__ = '0.5.1'
+
+
+if sys.version_info[0] == 2:
+    text_type = unicode
+    string_types = (str, unicode)
+    byte_to_int = ord
+    int_to_byte = chr
+
+    def to_bytes(x, charset=sys.getdefaultencoding(), errors='strict'):
+        if x is None:
+            return None
+        if isinstance(x, (bytes, bytearray, buffer)) or hasattr(x, '__str__'):
+            return bytes(x)
+        if isinstance(x, unicode):
+            return x.encode(charset, errors)
+        if hasattr(x, '__unicode__'):
+            return unicode(x).encode(charset, errors)
+        raise TypeError('expected bytes or unicode, not ' + type(x).__name__)
+
+    def to_native(x, charset=sys.getdefaultencoding(), errors='strict'):
+        if x is None or isinstance(x, str):
+            return x
+        return x.encode(charset, errors)
+
+    iterkeys = lambda d: d.iterkeys()
+    itervalues = lambda d: d.itervalues()
+    iteritems = lambda d: d.iteritems()
+    from urlparse import urlparse
+else:
+    text_type = str
+    string_types = (str,)
+
+    def byte_to_int(b):
+        if isinstance(b, int):
+            return b
+        raise TypeError('an integer is required')
+
+    int_to_byte = operator.methodcaller('to_bytes', 1, 'big')
+
+    def to_bytes(x, charset=sys.getdefaultencoding(), errors='strict'):
+        if x is None:
+            return None
+        if isinstance(x, (bytes, bytearray, memoryview)):
+            return bytes(x)
+        if isinstance(x, str):
+            return x.encode(charset, errors)
+        if hasattr(x, '__str__'):
+            return str(x).encode(charset, errors)
+        raise TypeError('expected bytes or str, not ' + type(x).__name__)
+
+    def to_native(x, charset=sys.getdefaultencoding(), errors='strict'):
+        if x is None or isinstance(x, str):
+            return x
+        return x.decode(charset, errors)
+
+    iterkeys = lambda d: iter(d.keys())
+    itervalues = lambda d: iter(d.values())
+    iteritems = lambda d: iter(d.items())
+    from urllib.parse import urlparse
+
+
 DATABASES = {}
 
 _libc = CDLL(find_library('c'))
 _libc.strtod.restype = c_double
 _libc.strtod.argtypes = [c_char_p, POINTER(c_char_p)]
 _strtod = _libc.strtod
+
+
+def timedelta_total_seconds(delta):
+    return delta.days * 86400 + delta.seconds + delta.microseconds / 1E6
 
 
 class _StrKeyDict(MutableMapping):
@@ -28,13 +96,13 @@ class _StrKeyDict(MutableMapping):
 
     def __getitem__(self, key):
         self._update_expired_keys()
-        return self._dict[str(key)]
+        return self._dict[to_bytes(key)]
 
     def __setitem__(self, key, value):
-        self._dict[str(key)] = value
+        self._dict[to_bytes(key)] = value
 
     def __delitem__(self, key):
-        del self._dict[key]
+        del self._dict[to_bytes(key)]
 
     def __len__(self):
         return len(self._dict)
@@ -46,14 +114,14 @@ class _StrKeyDict(MutableMapping):
         self._ex_keys[key] = timestamp
 
     def expiring(self, key):
-        if not key in self._ex_keys.keys():
+        if not key in self._ex_keys:
             return None
         return self._ex_keys[key]
 
     def _update_expired_keys(self):
         now = datetime.now()
         deleted = []
-        for key in self._ex_keys.keys():
+        for key in self._ex_keys:
             if now > self._ex_keys[key]:
                 deleted.append(key)
 
@@ -61,9 +129,18 @@ class _StrKeyDict(MutableMapping):
             del self._ex_keys[key]
             del self[key]
 
+    def copy(self):
+        new_copy = _StrKeyDict()
+        for key, value in self._dict.items():
+            new_copy[key] = value
+        return new_copy
+
     def clear(self):
         super(_StrKeyDict, self).clear()
         self._ex_keys.clear()
+
+    def to_bare_dict(self):
+        return copy.deepcopy(self._dict)
 
 
 class FakeStrictRedis(object):
@@ -77,19 +154,14 @@ class FakeStrictRedis(object):
                 db = 0
         return cls(db=db)
 
-    def __init__(self, db=0, **kwargs):
+    def __init__(self, db=0, charset='utf-8', errors='strict', **kwargs):
         if db not in DATABASES:
             DATABASES[db] = _StrKeyDict()
         self._db = DATABASES[db]
         self._db_num = db
+        self._encoding = charset
+        self._encoding_errors = errors
 
-    def _kvc(self, key, test_class):
-        """
-        Checks if the provided key is an instance of the provided class
-        Raises redis.ResponseError if the check fails
-        """
-        if not isinstance(self._db.get(key, test_class()), test_class):
-            raise redis.ResponseError('Operation against a key holding the wrong kind of value')
 
     def flushdb(self):
         DATABASES[self._db_num].clear()
@@ -101,7 +173,7 @@ class FakeStrictRedis(object):
 
     # Basic key commands
     def append(self, key, value):
-        self._db[key] += value
+        self._db[key] += to_bytes(value)
         return len(self._db[key])
 
     def bitcount(self, name, start=0, end=-1):
@@ -111,14 +183,14 @@ class FakeStrictRedis(object):
             end += 1
         try:
             s = self._db[name][start:end]
-            return sum([bin(ord(l)).count('1') for l in s])
+            return sum([bin(byte_to_int(l)).count('1') for l in s])
         except KeyError:
             return 0
 
     def decr(self, name, amount=1):
         try:
-            self._db[name] = self._db.get(name, 0) - amount
-        except TypeError:
+            self._db[name] = int(self._db.get(name, '0')) - amount
+        except (TypeError, ValueError):
             raise redis.ResponseError("value is not an integer or out of "
                                       "range.")
         return self._db[name]
@@ -128,6 +200,8 @@ class FakeStrictRedis(object):
     __contains__ = exists
 
     def expire(self, name, time):
+        if isinstance(time, timedelta):
+            time = int(timedelta_total_seconds(time))
         if self.exists(name):
             self._db.expire(name, datetime.now() + timedelta(seconds=time))
         else:
@@ -144,7 +218,7 @@ class FakeStrictRedis(object):
     def get(self, name):
         value = self._db.get(name)
         if value is not None:
-            return str(value)
+            return to_bytes(value)
 
     def __getitem__(self, name):
         return self._db[name]
@@ -152,11 +226,11 @@ class FakeStrictRedis(object):
     def getbit(self, name, offset):
         """Returns a boolean indicating the value of ``offset`` in ``name``"""
         val = self._db.get(name, '\x00')
-        byte = offset / 8
+        byte = offset // 8
         remaining = offset % 8
         actual_bitoffset = 7 - remaining
         try:
-            actual_val = ord(val[byte])
+            actual_val = byte_to_int(val[byte])
         except IndexError:
             return 0
         return 1 if (1 << actual_bitoffset) & actual_val else 0
@@ -177,15 +251,16 @@ class FakeStrictRedis(object):
         the value will be initialized as ``amount``
         """
         try:
-            self._db[name] = self._db.get(name, 0) + amount
-        except TypeError:
+            self._db[name] = int(self._db.get(name, '0')) + amount
+        except (TypeError, ValueError):
             raise redis.ResponseError("value is not an integer or out of "
                                       "range.")
         return self._db[name]
 
     def keys(self, pattern=None):
-        return [key for key in self._db.keys()
-                if not key or not pattern or fnmatch.fnmatch(key, pattern)]
+        return [key for key in self._db
+                if not key or not pattern or
+                fnmatch.fnmatch(to_native(key), to_native(pattern))]
 
     def mget(self, keys, *args):
         all_keys = self._list_or_args(keys, args)
@@ -195,7 +270,7 @@ class FakeStrictRedis(object):
         return found
 
     def mset(self, mapping):
-        for key, val in mapping.iteritems():
+        for key, val in iteritems(mapping):
             self.set(key, val)
         return True
 
@@ -205,7 +280,7 @@ class FakeStrictRedis(object):
         none of the keys are already set
         """
         if not any(k in self._db for k in mapping):
-            for key, val in mapping.iteritems():
+            for key, val in iteritems(mapping):
                 self.set(key, val)
             return True
         return False
@@ -241,11 +316,11 @@ class FakeStrictRedis(object):
         if (not nx and not xx) \
         or (nx and self._db.get(name, None) is None) \
         or (xx and not self._db.get(name, None) is None):
-            if ex > 0:
+            if ex is not None and ex > 0:
                 self._db.expire(name, datetime.now() + timedelta(seconds=ex))
-            elif px > 0:
+            elif px is not None and px > 0:
                 self._db.expire(name, datetime.now() + timedelta(milliseconds=px))
-            self._db[name] = value
+            self._db[name] = to_bytes(value)
             return True
         else:
             return None
@@ -253,27 +328,31 @@ class FakeStrictRedis(object):
     __setitem__ = set
 
     def setbit(self, name, offset, value):
-        val = self._db.get(name, '\x00')
-        byte = offset / 8
+        val = self._db.get(name, b'\x00')
+        byte = offset // 8
         remaining = offset % 8
         actual_bitoffset = 7 - remaining
         if len(val) - 1 < byte:
             # We need to expand val so that we can set the appropriate
             # bit.
             needed = byte - (len(val) - 1)
-            val += '\x00' * needed
+            val += b'\x00' * needed
         if value == 1:
-            new_byte = chr(ord(val[byte]) | (1 << actual_bitoffset))
+            new_byte = byte_to_int(val[byte]) | (1 << actual_bitoffset)
         else:
-            new_byte = chr(ord(val[byte]) ^ (1 << actual_bitoffset))
-        reconstructed = list(val)
+            new_byte = byte_to_int(val[byte]) ^ (1 << actual_bitoffset)
+        reconstructed = bytearray(val)
         reconstructed[byte] = new_byte
-        self._db[name] = ''.join(reconstructed)
+        self._db[name] = bytes(reconstructed)
 
     def setex(self, name, time, value):
+        if isinstance(time, timedelta):
+            time = int(timedelta_total_seconds(time))
         return self.set(name, value, ex=time)
 
     def psetex(self, name, time_ms, value):
+        if isinstance(time_ms, timedelta):
+            time_ms = int(timedelta_total_seconds(time_ms) * 1000)
         if time_ms == 0:
             raise ResponseError("invalid expire time in SETEX")
         return self.set(name, value, px=time_ms)
@@ -302,12 +381,18 @@ class FakeStrictRedis(object):
         try:
             return self._db[name][start:end]
         except KeyError:
-            return ''
+            return b''
     # Redis >= 2.0.0 this command is called getrange
     # according to the docs.
     getrange = substr
 
     def ttl(self, name):
+        return self._ttl(name)
+
+    def pttl(self, name):
+        return self._ttl(name, 1000)
+
+    def _ttl(self, name, multiplier=1):
         if name not in self._db:
             return None
 
@@ -319,9 +404,9 @@ class FakeStrictRedis(object):
         if now > exp_time:
             return None
         else:
-            return round((exp_time - now).days * 3600 * 24
-                         + (exp_time - now).seconds
-                         + (exp_time - now).microseconds / 1E6)
+            return round(((exp_time - now).days * 3600 * 24
+                          + (exp_time - now).seconds
+                          + (exp_time - now).microseconds / 1E6) * multiplier)
 
     def type(self, name):
         pass
@@ -337,6 +422,8 @@ class FakeStrictRedis(object):
         for name in names:
             try:
                 del self._db[name]
+                if name in self._db._ex_keys:
+                    del self._db._ex_keys[name]
                 deleted += 1
             except KeyError:
                 continue
@@ -368,7 +455,7 @@ class FakeStrictRedis(object):
             raise redis.RedisError(
                 "RedisError: ``start`` and ``num`` must both be specified")
         try:
-            data = self._db[name][:]
+            data = list(self._db[name])[:]
             if by is not None:
                 # _sort_using_by_arg mutates data so we don't
                 # need need a return value.
@@ -377,10 +464,10 @@ class FakeStrictRedis(object):
                 data.sort(key=self._strtod_key_func)
             else:
                 data.sort()
-            if not (start is None and num is None):
-                data = data[start:start + num]
             if desc:
                 data = list(reversed(data))
+            if not (start is None and num is None):
+                data = data[start:start + num]
             if store is not None:
                 self._db[store] = data
                 return len(data)
@@ -391,7 +478,7 @@ class FakeStrictRedis(object):
 
     def _retrive_data_from_sort(self, data, get):
         if get is not None:
-            if isinstance(get, basestring):
+            if isinstance(get, string_types):
                 get = [get]
             new_data = []
             for k in data:
@@ -402,14 +489,15 @@ class FakeStrictRedis(object):
         return data
 
     def _get_single_item(self, k, g):
-        if '*' in g:
-            g = g.replace('*', k)
-            if '->' in g:
-                key, hash_key = g.split('->')
+        g = to_bytes(g)
+        if b'*' in g:
+            g = g.replace(b'*', k)
+            if b'->' in g:
+                key, hash_key = g.split(b'->')
                 single_item = self._db.get(key, {}).get(hash_key)
             else:
                 single_item = self._db.get(g)
-        elif '#' in g:
+        elif b'#' in g:
             single_item = k
         else:
             single_item = None
@@ -417,7 +505,7 @@ class FakeStrictRedis(object):
 
     def _strtod_key_func(self, arg):
         # str()'ing the arg is important! Don't ever remove this.
-        arg = str(arg)
+        arg = to_bytes(arg)
         end = c_char_p()
         val = _strtod(arg, pointer(end))
         # real Redis also does an isnan check, not sure if
@@ -429,17 +517,19 @@ class FakeStrictRedis(object):
             return val
 
     def _sort_using_by_arg(self, data, by):
+        by = to_bytes(by)
         def _by_key(arg):
-            key = by.replace('*', arg)
-            if '->' in by:
-                key, hash_key = key.split('->')
+            key = by.replace(b'*', arg)
+            if b'->' in by:
+                key, hash_key = key.split(b'->')
                 return self._db.get(key, {}).get(hash_key)
             else:
                 return self._db.get(key)
         data.sort(key=_by_key)
 
     def lpush(self, name, *values):
-        self._db.setdefault(name, [])[0:0] = list(reversed((values)))
+        self._db.setdefault(name, [])[0:0] = list(reversed(
+            [to_bytes(x) for x in values]))
         return len(self._db[name])
 
     def lrange(self, name, start, end):
@@ -453,6 +543,7 @@ class FakeStrictRedis(object):
         return len(self._db.get(name, []))
 
     def lrem(self, name, count, value):
+        value = to_bytes(value)
         a_list = self._db.get(name, [])
         found = []
         for i, el in enumerate(a_list):
@@ -471,7 +562,7 @@ class FakeStrictRedis(object):
         return len(indices_to_remove)
 
     def rpush(self, name, *values):
-        self._db.setdefault(name, []).extend(list(values))
+        self._db.setdefault(name, []).extend([to_bytes(x) for x in values])
         return len(self._db[name])
 
     def lpop(self, name):
@@ -482,13 +573,13 @@ class FakeStrictRedis(object):
 
     def lset(self, name, index, value):
         try:
-            self._db.get(name, [])[index] = value
+            self._db.get(name, [])[index] = to_bytes(value)
         except IndexError:
             raise redis.ResponseError("index out of range")
 
     def rpushx(self, name, value):
         try:
-            self._db[name].append(value)
+            self._db[name].append(to_bytes(value))
         except KeyError:
             return
 
@@ -512,7 +603,7 @@ class FakeStrictRedis(object):
 
     def lpushx(self, name, value):
         try:
-            self._db[name].insert(0, value)
+            self._db[name].insert(0, to_bytes(value))
         except KeyError:
             return
 
@@ -523,8 +614,8 @@ class FakeStrictRedis(object):
             return None
 
     def linsert(self, name, where, refvalue, value):
-        index = self._db.get(name, []).index(refvalue)
-        self._db.get(name, []).insert(index, value)
+        index = self._db.get(name, []).index(to_bytes(refvalue))
+        self._db.get(name, []).insert(index, to_bytes(value))
 
     def rpoplpush(self, src, dst):
         el = self.rpop(src)
@@ -542,19 +633,19 @@ class FakeStrictRedis(object):
         #    pop from.
         # 2) If this is not the case then simulate a timeout.
         # This means that there's not really any blocking behavior here.
-        if isinstance(keys, basestring):
-            keys = [keys]
+        if isinstance(keys, string_types):
+            keys = [to_bytes(keys)]
         else:
-            keys = list(keys)
+            keys = [to_bytes(k) for k in keys]
         for key in keys:
             if self._db.get(key, []):
                 return (key, self._db[key].pop(0))
 
     def brpop(self, keys, timeout=0):
-        if isinstance(keys, basestring):
-            keys = [keys]
+        if isinstance(keys, string_types):
+            keys = [to_bytes(keys)]
         else:
-            keys = list(keys)
+            keys = [to_bytes(k) for k in keys]
         for key in keys:
             if self._db.get(key, []):
                 return (key, self._db[key].pop())
@@ -569,7 +660,6 @@ class FakeStrictRedis(object):
         return el
 
     def hdel(self, name, *keys):
-        self._kvc(name, dict)
         h = self._db.get(name, {})
         rem = 0
         for k in keys:
@@ -580,7 +670,6 @@ class FakeStrictRedis(object):
 
     def hexists(self, name, key):
         "Returns a boolean indicating if ``key`` exists within hash ``name``"
-        self._kvc(name, dict)
         if self._db.get(name, {}).get(key) is None:
             return 0
         else:
@@ -588,29 +677,27 @@ class FakeStrictRedis(object):
 
     def hget(self, name, key):
         "Return the value of ``key`` within the hash ``name``"
-        self._kvc(name, dict)
         return self._db.get(name, {}).get(key)
 
     def hgetall(self, name):
         "Return a Python dict of the hash's name/value pairs"
-        self._kvc(name, dict)
-        return self._db.get(name, {})
+        all_items = self._db.get(name, {})
+        if hasattr(all_items, 'to_bare_dict'):
+            all_items = all_items.to_bare_dict()
+        return all_items
 
     def hincrby(self, name, key, amount=1):
         "Increment the value of ``key`` in hash ``name`` by ``amount``"
-        self._kvc(name, dict)
-        new = self._db.setdefault(name, {}).get(key, 0) + amount
+        new = int(self._db.setdefault(name, _StrKeyDict()).get(key, '0')) + amount
         self._db[name][key] = new
         return new
 
     def hkeys(self, name):
         "Return the list of keys within hash ``name``"
-        self._kvc(name, dict)
-        return self._db.get(name, {}).keys()
+        return list(self._db.get(name, {}))
 
     def hlen(self, name):
         "Return the number of elements in hash ``name``"
-        self._kvc(name, dict)
         return len(self._db.get(name, {}))
 
     def hset(self, name, key, value):
@@ -618,9 +705,8 @@ class FakeStrictRedis(object):
         Set ``key`` to ``value`` within hash ``name``
         Returns 1 if HSET created a new field, otherwise 0
         """
-        self._kvc(name, dict)
         key_is_new = key not in self._db.get(name, {})
-        self._db.setdefault(name, {})[key] = value
+        self._db.setdefault(name, _StrKeyDict())[key] = to_bytes(value)
         return 1 if key_is_new else 0
 
     def hsetnx(self, name, key, value):
@@ -628,10 +714,9 @@ class FakeStrictRedis(object):
         Set ``key`` to ``value`` within hash ``name`` if ``key`` does not
         exist.  Returns 1 if HSETNX created a field, otherwise 0.
         """
-        self._kvc(name, dict)
         if key in self._db.get(name, {}):
             return False
-        self._db.setdefault(name, {})[key] = value
+        self._db.setdefault(name, _StrKeyDict())[key] = to_bytes(value)
         return True
 
     def hmset(self, name, mapping):
@@ -639,29 +724,28 @@ class FakeStrictRedis(object):
         Sets each key in the ``mapping`` dict to its corresponding value
         in the hash ``name``
         """
-        self._kvc(name, dict)
         if not mapping:
             raise redis.DataError("'hmset' with 'mapping' of length 0")
-        self._db.setdefault(name, {}).update(mapping)
+        for k, v in mapping.items():
+          mapping[k] = to_bytes(v)
+        self._db.setdefault(name, _StrKeyDict()).update(mapping)
         return True
 
     def hmget(self, name, keys, *args):
         "Returns a list of values ordered identically to ``keys``"
-        self._kvc(name, dict)
         h = self._db.get(name, {})
         all_keys = self._list_or_args(keys, args)
         return [h.get(k) for k in all_keys]
 
     def hvals(self, name):
         "Return the list of values within hash ``name``"
-        self._kvc(name, dict)
         return self._db.get(name, {}).values()
 
     def sadd(self, name, *values):
         "Add ``value`` to set ``name``"
         a_set = self._db.setdefault(name, set())
         card = len(a_set)
-        a_set |= set(values)
+        a_set |= set(to_bytes(x) for x in values)
         return len(a_set) - card
 
     def scard(self, name):
@@ -670,9 +754,9 @@ class FakeStrictRedis(object):
 
     def sdiff(self, keys, *args):
         "Return the difference of sets specified by ``keys``"
-        all_keys = self._list_or_args(keys, args)
-        diff = self._db.get(all_keys[0], set()).copy()
-        for key in all_keys[1:]:
+        all_keys = (to_bytes(x) for x in self._list_or_args(keys, args))
+        diff = self._db.get(next(all_keys), set()).copy()
+        for key in all_keys:
             diff -= self._db.get(key, set())
         return diff
 
@@ -687,9 +771,9 @@ class FakeStrictRedis(object):
 
     def sinter(self, keys, *args):
         "Return the intersection of sets specified by ``keys``"
-        all_keys = self._list_or_args(keys, args)
-        intersect = self._db.get(all_keys[0], set()).copy()
-        for key in all_keys[1:]:
+        all_keys = (to_bytes(x) for x in self._list_or_args(keys, args))
+        intersect = self._db.get(next(all_keys), set()).copy()
+        for key in all_keys:
             intersect.intersection_update(self._db.get(key, set()))
         return intersect
 
@@ -704,13 +788,14 @@ class FakeStrictRedis(object):
 
     def sismember(self, name, value):
         "Return a boolean indicating if ``value`` is a member of set ``name``"
-        return value in self._db.get(name, set())
+        return to_bytes(value) in self._db.get(name, set())
 
     def smembers(self, name):
         "Return all members of the set ``name``"
         return self._db.get(name, set())
 
     def smove(self, src, dst, value):
+        value = to_bytes(value)
         try:
             self._db.get(src, set()).remove(value)
             self._db.setdefault(dst, set()).add(value)
@@ -736,14 +821,14 @@ class FakeStrictRedis(object):
         "Remove ``value`` from set ``name``"
         a_set = self._db.setdefault(name, set())
         card = len(a_set)
-        a_set -= set(values)
+        a_set -= set(to_bytes(x) for x in values)
         return card - len(a_set)
 
     def sunion(self, keys, *args):
         "Return the union of sets specifiued by ``keys``"
-        all_keys = self._list_or_args(keys, args)
-        union = self._db.get(all_keys[0], set()).copy()
-        for key in all_keys[1:]:
+        all_keys = (to_bytes(x) for x in self._list_or_args(keys, args))
+        union = self._db.get(next(all_keys), set()).copy()
+        for key in all_keys:
             union.update(self._db.get(key, set()))
         return union
 
@@ -755,6 +840,40 @@ class FakeStrictRedis(object):
         union = self.sunion(keys, *args)
         self._db[dest] = union
         return len(union)
+
+    def _get_zelement_range_filter_func(self, min_val, max_val):
+        # This will return a filter function based on the
+        # min and max values.  It takes a single argument
+        # and return True if it matches the range filter
+        # criteria, and False otherwise.
+
+        # This will also handle the case when
+        # min/max are '-inf', '+inf'.
+        # It needs to handle exclusive intervals
+        # where the min/max value is something like
+        # '(0'
+        #     a             <    x        <           b
+        #     ^             ^             ^           ^
+        # actual_min   left_comp     right_comp  actual_max
+        left_comparator, actual_min = self._get_comparator_and_val(min_val)
+        right_comparator, actual_max = self._get_comparator_and_val(max_val)
+
+        def _matches(x):
+            return (left_comparator(actual_min, x) and
+                    right_comparator(x, actual_max))
+        return _matches
+
+    def _get_comparator_and_val(self, value):
+        try:
+            if isinstance(value, string_types) and value.startswith('('):
+                comparator = operator.lt
+                actual_value = float(value[1:])
+            else:
+                comparator = operator.le
+                actual_value = float(value)
+        except ValueError:
+            raise redis.ResponseError('min or max is not a float')
+        return comparator, actual_value
 
     def zadd(self, name, *args, **kwargs):
         """
@@ -770,7 +889,7 @@ class FakeStrictRedis(object):
         if len(args) % 2 != 0:
             raise redis.RedisError("ZADD requires an equal number of "
                                    "values and scores")
-        zset = self._db.setdefault(name, {})
+        zset = self._db.setdefault(name, _StrKeyDict())
         added = 0
         for score, value in zip(*[args[i::2] for i in range(2)]):
             if value not in zset:
@@ -794,14 +913,15 @@ class FakeStrictRedis(object):
 
     def zcount(self, name, min, max):
         found = 0
+        filter_func = self._get_zelement_range_filter_func(min, max)
         for score in self._db.get(name, {}).values():
-            if min <= score <= max:
+            if filter_func(score):
                 found += 1
         return found
 
     def zincrby(self, name, value, amount=1):
         "Increment the score of ``value`` in sorted set ``name`` by ``amount``"
-        d = self._db.setdefault(name, {})
+        d = self._db.setdefault(name, _StrKeyDict())
         score = d.get(value, 0) + amount
         d[value] = score
         return score
@@ -854,7 +974,7 @@ class FakeStrictRedis(object):
             return [(k, all_items[k]) for k in items]
 
     def _get_zelements_in_order(self, all_items, reverse=False):
-        by_keyname = sorted(all_items.items(), key=lambda x: x[0])
+        by_keyname = sorted(all_items.items(), key=lambda x: x[0], reverse=reverse)
         in_order = sorted(by_keyname, key=lambda x: x[1], reverse=reverse)
         return [el[0] for el in in_order]
 
@@ -880,9 +1000,10 @@ class FakeStrictRedis(object):
                                    "be specified")
         all_items = self._db.get(name, {})
         in_order = self._get_zelements_in_order(all_items, reverse=reverse)
+        filter_func = self._get_zelement_range_filter_func(min, max)
         matches = []
         for item in in_order:
-            if min <= all_items[item] <= max:
+            if filter_func(all_items[item]):
                 matches.append(item)
         if start is not None:
             matches = matches[start:start + num]
@@ -898,7 +1019,7 @@ class FakeStrictRedis(object):
         all_items = self._db.get(name, {})
         in_order = sorted(all_items, key=lambda x: all_items[x])
         try:
-            return in_order.index(value)
+            return in_order.index(to_bytes(value))
         except ValueError:
             return None
 
@@ -937,12 +1058,14 @@ class FakeStrictRedis(object):
         between ``min`` and ``max``. Returns the number of elements removed.
         """
         all_items = self._db.get(name, {})
+        filter_func = self._get_zelement_range_filter_func(min, max)
         removed = 0
         for key in all_items.copy():
-            if min <= all_items[key] <= max:
+            if filter_func(all_items[key]):
                 del all_items[key]
                 removed += 1
         return removed
+
 
     def zrevrange(self, name, start, num, withscores=False):
         """
@@ -1000,7 +1123,7 @@ class FakeStrictRedis(object):
         self._zaggregate(dest, keys, aggregate, lambda x: True)
 
     def _zaggregate(self, dest, keys, aggregate, should_include):
-        new_zset = {}
+        new_zset = _StrKeyDict()
         if aggregate is None:
             aggregate = 'SUM'
         # This is what the actual redis client uses, so we'll use
@@ -1034,7 +1157,7 @@ class FakeStrictRedis(object):
         # Returns a single list combining keys and args.
         # A string can be iterated, but indicates
         # keys wasn't passed as a list.
-        if isinstance(keys, basestring):
+        if isinstance(keys, string_types):
             keys = [keys]
         if args:
             keys.extend(args)
@@ -1086,9 +1209,9 @@ class FakeRedis(FakeStrictRedis):
                 "Passing 'value' and 'score' has been deprecated. "
                 "Please pass via kwargs instead."))
         else:
-            value = pairs.keys()[0]
-            score = pairs.values()[0]
-        self._db.setdefault(name, {})[value] = score
+            value = list(pairs)[0]
+            score = list(pairs.values())[0]
+        self._db.setdefault(name, _StrKeyDict())[value] = score
 
 
 class FakePipeline(object):
